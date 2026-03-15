@@ -1,524 +1,289 @@
 """
-Autoresearch pretraining script using x-transformers.
-Single-GPU, single-file, time-budgeted training on enwik8.
+train_rl.py — autoresearch training script for x-transformers-rl.
 
-Hardware: Any NVIDIA GPU with >= 8 GB VRAM (tested on RTX 4090).
-          FP8 supported on Ada Lovelace / Hopper / Blackwell (SM89+).
-Precision: BF16 (default), FP8 via torchao (optional), FP16 (optional)
-Optimizer: MuonAdamAtan2 (Muon for matrix params, AdamAtan2 for rest)
+This is the RL counterpart of train.py.  The agent modifies this file to
+experiment with different world-model architectures, PPO hyperparameters, and
+training configurations.
+
+Environment: CartPole-v1 (gymnasium)
+  - Observation: 4-dim continuous state vector.
+  - Action: 2 discrete actions (push left / push right).
+  - Reward: +1 per timestep the pole stays upright.
+  - Solved: mean episode reward >= 475 over 100 consecutive episodes.
+  - Max episode length: 500 steps.
+
+Metric: mean_reward (higher is better), evaluated greedily after training.
+
+Budget: Fixed **5-minute wall clock** training time (TIME_BUDGET = 300 seconds),
+matching the LM autoresearch.  The script runs as many learning updates as fit
+in the time budget, then does a final evaluation.
 
 Usage:
-    python train.py                      # BF16 (default, always works)
-    USE_FP8=1 python train.py            # FP8 via torchao (SM89+)
-    USE_FP16=1 python train.py           # FP16 instead of BF16
+    CUDA_VISIBLE_DEVICES=0 LD_LIBRARY_PATH=... python train_rl.py
 
-References:
-    - x-transformers: https://github.com/lucidrains/x-transformers
-    - See docs/adjustable_params.md for full parameter reference
+Output block (parseable, grepped by the experiment loop):
+    ---
+    mean_reward:       123.45
+    best_reward:       456.78
+    num_updates:       150
+    total_episodes:    3750
+    training_seconds:  300.1
+    total_seconds:     305.2
+    peak_vram_mb:      123.5
+    num_params_M:      0.12
+    hidden_dim:        64
+    world_model_depth: 2
 """
 
-import os
-
-os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
-
-import gc
 import sys
-import math
+import os
 import time
-import gzip
-import random
+import gc
+
+# ---------------------------------------------------------------------------
+# Path setup — pick up the local submodules first
+# ---------------------------------------------------------------------------
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "x-transformers-rl"))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "x-transformers"))
+
+# ---------------------------------------------------------------------------
+# Hyperparameters — everything the agent may tune
+# ---------------------------------------------------------------------------
+
+# --- Time budget ---
+TIME_BUDGET = 300  # 5-minute wall clock training time (seconds)
+
+# --- Environment ---
+ENV_NAME = "CartPole-v1"
+MAX_TIMESTEPS = 500  # Max steps per episode (gymnasium default)
+
+# --- Critic value range ---
+# CartPole gives +1 per step.  With gamma=0.99 and max 500 steps, the
+# discounted return ranges roughly from 0 to ~200.  We give the HL-Gauss
+# distributional critic a wide enough range to cover this.
+REWARD_RANGE = (0.0, 250.0)
+
+# --- World model architecture ---
+HIDDEN_DIM = 64  # Transformer residual-stream dimension
+WORLD_MODEL_DEPTH = 2  # Number of transformer layers
+WORLD_MODEL_HEADS = 4  # Number of attention heads
+WORLD_MODEL_DIM_HEAD = 16  # Per-head dimension
+
+WORLD_MODEL = dict(
+    depth=WORLD_MODEL_DEPTH,
+    attn_gate_values=True,
+    add_value_residual=True,
+    ff_relu_squared=True,
+    learned_value_residual_mix=True,
+    attn_flash=True,
+)
+
+# --- Training ---
+NUM_EPISODES_PER_UPDATE = 25  # Episodes collected before each PPO update
+BATCH_SIZE = 5  # PPO mini-batch size (must divide NUM_EPISODES_PER_UPDATE)
+PPO_EPOCHS = 3  # PPO epochs per update
+LEARNING_RATE = 8e-4
+BETAS = (0.9, 0.99)
+GAMMA = 0.99  # Discount factor
+LAM = 0.95  # GAE lambda
+ENTROPY_WEIGHT = 0.01  # Entropy bonus coefficient
+EPS_CLIP = 0.2  # PPO clipping epsilon
+VALUE_CLIP = 0.4  # Critic value clipping
+EMA_DECAY = 0.9  # EMA decay for behavior policy
+REGEN_REG_RATE = 1e-4  # Regenerative regularization rate
+CAUTIOUS_FACTOR = 0.1  # Cautious update factor
+
+# --- World model schedule ---
+# Ramp the world-model embedding contribution from 0 to 1 over steps 5-20.
+WORLD_MODEL_EMBED_SCHEDULE = (5.0, 20.0)
+
+# --- Agent extra kwargs ---
+AGENT_KWARGS = dict(
+    hidden_dim=HIDDEN_DIM,
+    world_model_attn_dim_head=WORLD_MODEL_DIM_HEAD,
+    world_model_heads=WORLD_MODEL_HEADS,
+    world_model_attn_hybrid_gru=False,
+    world_model_embed_linear_schedule=WORLD_MODEL_EMBED_SCHEDULE,
+    actor_critic_world_model=dict(
+        frac_critic_head_gradient=5e-2,
+        frac_actor_head_gradient=5e-2,
+        use_simple_policy_optimization=False,
+        add_entropy_to_advantage=False,
+    ),
+)
+
+# --- Evaluation ---
+NUM_EVAL_EPISODES = 30  # Greedy eval episodes after training
+EVAL_INTERVAL = 10  # Eval every N learning updates (0 = no intermediate eval)
+
+# ---------------------------------------------------------------------------
+# Imports
+# ---------------------------------------------------------------------------
 
 import numpy as np
 import torch
-import torch.nn.functional as F
-from torch.utils.data import DataLoader, Dataset
+import gymnasium as gym
+
+from x_transformers_rl import Learner
 
 # ---------------------------------------------------------------------------
-# x-transformers (from local ./x-transformers submodule)
+# Helper: count model parameters
 # ---------------------------------------------------------------------------
 
-sys.path.insert(
-    0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "x-transformers")
-)
 
-from x_transformers import TransformerWrapper, Decoder
-from x_transformers.autoregressive_wrapper import AutoregressiveWrapper
-
-# ---------------------------------------------------------------------------
-# Precision selection: FP8 (torchao), FP16, or BF16 (default)
-# ---------------------------------------------------------------------------
-
-USE_FP8 = os.environ.get("USE_FP8", "0") == "1"
-USE_FP16 = os.environ.get("USE_FP16", "0") == "1"
-fp8_available = False
-
-if USE_FP8:
-    try:
-        from torchao.float8 import Float8LinearConfig, convert_to_float8_training
-
-        fp8_available = True
-        print("FP8: torchao float8 training loaded successfully")
-    except ImportError:
-        print("FP8: torchao not installed, falling back to BF16")
-        print("  Install with: pip install torchao")
-        USE_FP8 = False
-
-# ---------------------------------------------------------------------------
-# Optimizer (MuonAdamAtan2 or fallback to AdamW)
-# ---------------------------------------------------------------------------
-
-try:
-    from adam_atan2_pytorch import MuonAdamAtan2
-
-    HAS_MUON = True
-except ImportError:
-    print("Warning: adam-atan2-pytorch not installed, falling back to AdamW")
-    print("  Install with: pip install adam-atan2-pytorch")
-    HAS_MUON = False
-
-# ---------------------------------------------------------------------------
-# Constants (fixed, do not modify)
-# ---------------------------------------------------------------------------
-
-MAX_SEQ_LEN = 4096  # context length for enwik8 training
-TIME_BUDGET = 300  # training time budget in seconds (5 minutes)
-EVAL_TOKENS = 5_000_000  # validation set size (5M bytes)
-
-# ---------------------------------------------------------------------------
-# Hyperparameters (edit these directly, no CLI flags needed)
-# ---------------------------------------------------------------------------
-
-# Model architecture (x-transformers Decoder)
-MODEL_DIM = 448  # hidden dimension
-MODEL_DEPTH = 6  # number of transformer layers
-MODEL_HEADS = 7  # number of attention heads
-VOCAB_SIZE = 256  # byte-level (char-level), one token per byte value
-
-# Optimization
-LEARNING_RATE = 1.1e-2  # slightly above 1e-2 with clip=0.8
-BATCH_SIZE = 24  # per-device micro-batch size
-GRADIENT_ACCUMULATE_EVERY = 1  # gradient accumulation steps
-WEIGHT_DECAY = 0.1  # AdamW weight decay
-GRAD_CLIP = 0.8  # gradient norm clipping (between 0.5 and 1.0)
-
-# LR Schedule (time-based)
-WARMUP_RATIO = 0.05  # fraction of time budget for LR warmup
-WARMDOWN_RATIO = 0.47  # fine-tuning between 0.45 and 0.5
-FINAL_LR_FRAC = 0.02  # final LR as fraction of initial
-
-# Logging
-VALIDATE_EVERY = 100  # validation frequency (in steps)
-GENERATE_EVERY = 500  # text generation frequency (in steps)
-GENERATE_LENGTH = 512  # tokens to generate for qualitative eval
-
-# GPU performance reference for MFU estimation
-# RTX 4090 BF16 peak: ~330 TFLOPS (adjust for your GPU)
-GPU_BF16_PEAK_FLOPS = 330e12
-
-# ---------------------------------------------------------------------------
-# Data: enwik8 (character-level)
-# ---------------------------------------------------------------------------
-
-DATA_PATH = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)), "x-transformers", "data", "enwik8.gz"
-)
-
-
-def load_enwik8(data_path=DATA_PATH):
-    """Load enwik8 dataset: 90M train, 5M validation."""
-    with gzip.open(data_path) as f:
-        data = np.frombuffer(f.read(int(95e6)), dtype=np.uint8).copy()
-        train_x, valid_x = np.split(data, [int(90e6)])
-        return torch.from_numpy(train_x), torch.from_numpy(valid_x)
-
-
-class TextSamplerDataset(Dataset):
-    """Random subsequence sampler from a byte tensor."""
-
-    def __init__(self, data, seq_len):
-        super().__init__()
-        self.data = data
-        self.seq_len = seq_len
-
-    def __getitem__(self, index):
-        rand_start = torch.randint(0, self.data.size(0) - self.seq_len - 1, (1,))
-        full_seq = self.data[rand_start : rand_start + self.seq_len + 1].long()
-        return full_seq.cuda()
-
-    def __len__(self):
-        return self.data.size(0) // self.seq_len
-
-
-def cycle(loader):
-    """Infinite iterator over a DataLoader."""
-    while True:
-        for data in loader:
-            yield data
-
-
-def decode_token(token):
-    return str(chr(max(32, token)))
-
-
-def decode_tokens(tokens):
-    return "".join(list(map(decode_token, tokens)))
+def count_params(model):
+    return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
 
 # ---------------------------------------------------------------------------
-# Evaluation: Bits Per Character (BPC)
+# Evaluation: run greedy rollouts, return mean episode reward
 # ---------------------------------------------------------------------------
 
 
 @torch.no_grad()
-def evaluate_bpc(ar_model, val_loader, num_eval_batches=50):
-    """
-    Compute bits per character (BPC) on validation set.
-    BPC = cross_entropy_loss / ln(2)
-    For char-level models, BPC ≡ BPB (bits per byte).
-    """
-    ar_model.eval()
-    total_loss = 0.0
-    total_tokens = 0
+def evaluate(agent, env_name, num_eval_episodes=30, max_timesteps=500):
+    """Run the agent greedily and return (mean_reward, best_reward)."""
+    agent.eval()
+    rewards = []
+    eval_env = gym.make(env_name)
 
-    for _ in range(num_eval_batches):
-        data = next(val_loader)
-        # AutoregressiveWrapper splits into x[:, :-1] and targets[:, 1:]
-        loss = ar_model(data)
-        batch_tokens = data.size(0) * (data.size(1) - 1)
-        total_loss += loss.item() * batch_tokens
-        total_tokens += batch_tokens
+    for _ in range(num_eval_episodes):
+        obs, _ = eval_env.reset()
+        hiddens = None
+        episode_reward = 0.0
+        for _ in range(max_timesteps):
+            raw_actions, hiddens = agent(obs, hiddens=hiddens)
+            # Greedy action selection
+            action = raw_actions.argmax().item()
+            obs, reward, terminated, truncated, *_ = eval_env.step(action)
+            episode_reward += float(reward)
+            if terminated or truncated:
+                break
+        rewards.append(episode_reward)
 
-    avg_loss = total_loss / total_tokens
-    bpc = avg_loss / math.log(2)
-    return bpc
-
-
-# ---------------------------------------------------------------------------
-# Model construction
-# ---------------------------------------------------------------------------
-
-
-def build_model():
-    """Build x-transformers decoder model wrapped for autoregressive training."""
-    model = TransformerWrapper(
-        num_tokens=VOCAB_SIZE,
-        max_seq_len=MAX_SEQ_LEN,
-        post_emb_norm=True,  # LayerNorm after embeddings (BLOOM/YaLM-style)
-        emb_frac_gradient=0.1,  # GLM-130B: reduce embedding gradient flow
-        attn_layers=Decoder(
-            dim=MODEL_DIM,
-            depth=MODEL_DEPTH,
-            heads=MODEL_HEADS,
-            rotary_pos_emb=True,  # RoPE (standard for modern transformers)
-            rotary_xpos=True,  # xPos: position-dependent scaling for long context
-            attn_flash=True,  # PyTorch SDP flash attention
-            attn_qk_norm=True,  # QK normalization for training stability
-            attn_laser=True,  # LASER: gradient enhancement via exponentiated values
-            ff_glu=True,  # Gated Linear Unit
-            ff_swish=True,  # SwiGLU activation (PaLM/LLaMA-style)
-            ff_glu_mult_bias=True,  # learnable bias in GLU gate
-            use_rmsnorm=True,  # RMSNorm instead of LayerNorm
-            add_value_residual=True,  # ResFormer value residuals
-            shift_tokens=1,  # shift features by 1 token (helps char-level)
-            softclamp_output=True,  # Gemma 2: soft-clamp final hidden states
-            zero_init_branch_output=True,  # GPT-NeoX: zero-init output projections
-        ),
-    )
-
-    # Wrap for autoregressive language modeling (handles input/target split + loss)
-    ar_model = AutoregressiveWrapper(model)
-    return ar_model
+    eval_env.close()
+    return float(np.mean(rewards)), float(np.max(rewards))
 
 
 # ---------------------------------------------------------------------------
-# Optimizer construction
-# ---------------------------------------------------------------------------
-
-
-def build_optimizer(model):
-    """Build MuonAdamAtan2 optimizer (or fallback to AdamW)."""
-    if HAS_MUON:
-        # x-transformers TransformerWrapper exposes .muon_parameters()
-        # which returns the linear weight matrices suitable for Muon
-        inner_model = model.net  # unwrap AutoregressiveWrapper -> TransformerWrapper
-        optimizer = MuonAdamAtan2(
-            muon_params=inner_model.muon_parameters(),
-            params=inner_model.parameters(),
-            remove_muon_params_from_params=True,
-            lr=LEARNING_RATE,
-            weight_decay=0.001,  # very small decoupled WD
-            decoupled_wd=True,
-            betas=(0.92, 0.99),  # AdamAtan2 betas matching muon_beta1
-            muon_rms_factor=0.1,  # smaller Muon updates (default 0.2)
-            muon_beta1=0.92,  # less momentum than default 0.95
-        )
-    else:
-        optimizer = torch.optim.AdamW(
-            model.parameters(),
-            lr=LEARNING_RATE,
-            weight_decay=WEIGHT_DECAY,
-        )
-    return optimizer
-
-
-# ---------------------------------------------------------------------------
-# LR Schedule (time-based, matching Karpathy's autoresearch pattern)
-# ---------------------------------------------------------------------------
-
-
-def get_lr_multiplier(progress):
-    """Time-based LR schedule: warmup -> constant -> cosine cooldown."""
-    if progress < WARMUP_RATIO:
-        return progress / WARMUP_RATIO if WARMUP_RATIO > 0 else 1.0
-    elif progress < 1.0 - WARMDOWN_RATIO:
-        return 1.0
-    else:
-        cooldown = (1.0 - progress) / WARMDOWN_RATIO
-        return cooldown * 1.0 + (1 - cooldown) * FINAL_LR_FRAC
-
-
-# ---------------------------------------------------------------------------
-# Precision context manager
-# ---------------------------------------------------------------------------
-
-
-def get_precision_context():
-    """Return the appropriate AMP context manager.
-
-    FP8 note: torchao FP8 converts nn.Linear layers in-place to use FP8
-    compute kernels. The autocast wrapper is still BF16 for non-linear ops.
-    """
-    if USE_FP16:
-        return torch.amp.autocast(device_type="cuda", dtype=torch.float16)
-    else:
-        # BF16 for both default and FP8 modes (FP8 is handled by torchao layer conversion)
-        return torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16)
-
-
-# ---------------------------------------------------------------------------
-# Estimate FLOPs
-# ---------------------------------------------------------------------------
-
-
-def estimate_flops_per_token(num_params, seq_len, depth, heads, dim):
-    """Rough FLOPs per token estimate (forward + backward ≈ 6N + attention)."""
-    head_dim = dim // heads
-    attn_flops = 12 * heads * head_dim * seq_len * depth
-    return 6 * num_params + attn_flops
-
-
-# ---------------------------------------------------------------------------
-# Training
+# Main training loop
 # ---------------------------------------------------------------------------
 
 
 def main():
-    t_start = time.time()
-    torch.manual_seed(42)
-    torch.cuda.manual_seed(42)
-    torch.set_float32_matmul_precision("high")
+    t_start_total = time.time()
 
-    if USE_FP8 and fp8_available:
-        precision_tag = "FP8"
-    elif USE_FP16:
-        precision_tag = "FP16"
-    else:
-        precision_tag = "BF16"
-    print(f"Precision: {precision_tag}")
-    print(f"Device: {torch.cuda.get_device_name(0)}")
-    print(f"VRAM: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.1f} GB")
+    # -- Environment --
+    env = gym.make(ENV_NAME)
+    state_dim = env.observation_space.shape[0]  # 4 for CartPole
+    num_actions = env.action_space.n  # 2 for CartPole
 
-    # Data
-    print("Loading enwik8...")
-    data_train, data_val = load_enwik8()
-    train_dataset = TextSamplerDataset(data_train, MAX_SEQ_LEN)
-    val_dataset = TextSamplerDataset(data_val, MAX_SEQ_LEN)
-    train_loader = cycle(
-        DataLoader(train_dataset, batch_size=BATCH_SIZE, drop_last=True)
+    # -- Learner (world model + actor + critic + PPO) --
+    learner = Learner(
+        state_dim=state_dim,
+        num_actions=num_actions,
+        reward_range=REWARD_RANGE,
+        max_timesteps=MAX_TIMESTEPS,
+        batch_size=BATCH_SIZE,
+        num_episodes_per_update=NUM_EPISODES_PER_UPDATE,
+        world_model=WORLD_MODEL,
+        lr=LEARNING_RATE,
+        betas=BETAS,
+        gamma=GAMMA,
+        lam=LAM,
+        entropy_weight=ENTROPY_WEIGHT,
+        eps_clip=EPS_CLIP,
+        value_clip=VALUE_CLIP,
+        ema_decay=EMA_DECAY,
+        regen_reg_rate=REGEN_REG_RATE,
+        cautious_factor=CAUTIOUS_FACTOR,
+        epochs=PPO_EPOCHS,
+        agent_kwargs=AGENT_KWARGS,
     )
-    val_loader = cycle(DataLoader(val_dataset, batch_size=BATCH_SIZE, drop_last=True))
 
-    # Model
-    print(f"Building model: dim={MODEL_DIM}, depth={MODEL_DEPTH}, heads={MODEL_HEADS}")
-    ar_model = build_model()
-    ar_model.cuda()
+    agent = learner.agent
+    num_params = count_params(agent.model)
+    print(f"Model parameters: {num_params / 1e6:.4f}M")
 
-    num_params = sum(p.numel() for p in ar_model.parameters())
-    print(f"Parameters: {num_params:,} ({num_params / 1e6:.1f}M)")
+    # -- Training with time budget --
+    if torch.cuda.is_available():
+        torch.cuda.reset_peak_memory_stats()
 
-    # FP8: convert nn.Linear layers to use FP8 compute (before optimizer creation)
-    if USE_FP8 and fp8_available:
-        fp8_config = Float8LinearConfig(pad_inner_dim=True)
-        convert_to_float8_training(ar_model.net.attn_layers, config=fp8_config)
-        print("FP8: transformer attention/FFN layers converted to float8 training")
+    # Freeze GC for speed after first update
+    gc_frozen = False
 
-    flops_per_token = estimate_flops_per_token(
-        num_params, MAX_SEQ_LEN, MODEL_DEPTH, MODEL_HEADS, MODEL_DIM
-    )
-    print(f"Estimated FLOPs per token: {flops_per_token:.2e}")
-
-    # Optimizer
-    optimizer = build_optimizer(ar_model)
-    initial_lr = LEARNING_RATE
-
-    # Compile model for speed (PyTorch 2.0+)
-    try:
-        ar_model = torch.compile(ar_model, dynamic=False)
-        print("torch.compile: enabled")
-    except Exception as e:
-        print(f"torch.compile: failed ({e}), running eager mode")
-
-    # Effective batch size
-    effective_batch_tokens = BATCH_SIZE * MAX_SEQ_LEN * GRADIENT_ACCUMULATE_EVERY
-    print(
-        f"Effective batch: {BATCH_SIZE} x {MAX_SEQ_LEN} x {GRADIENT_ACCUMULATE_EVERY} = {effective_batch_tokens:,} tokens"
-    )
-    print(f"Time budget: {TIME_BUDGET}s")
-    print(f"Optimizer: {'MuonAdamAtan2' if HAS_MUON else 'AdamW'}")
-
-    # Training loop
-    t_start_training = time.time()
-    total_training_time = 0.0
-    step = 0
-    smooth_loss = 0.0
-    precision_ctx = get_precision_context()
+    t_start_train = time.time()
+    num_updates = 0
+    total_episodes = 0
+    best_eval_reward = -float("inf")
 
     while True:
-        torch.cuda.synchronize()
-        t0 = time.time()
-
-        ar_model.train()
-
-        # Gradient accumulation
-        accumulated_loss = 0.0
-        for _ in range(GRADIENT_ACCUMULATE_EVERY):
-            with precision_ctx:
-                loss = ar_model(next(train_loader))
-            (loss / GRADIENT_ACCUMULATE_EVERY).backward()
-            accumulated_loss += loss.item()
-
-        train_loss = accumulated_loss / GRADIENT_ACCUMULATE_EVERY
-
-        # Gradient clipping
-        torch.nn.utils.clip_grad_norm_(ar_model.parameters(), GRAD_CLIP)
-
-        # LR schedule
-        progress = (
-            min(total_training_time / TIME_BUDGET, 1.0) if TIME_BUDGET > 0 else 0.0
-        )
-        lrm = get_lr_multiplier(progress)
-        current_lr = initial_lr * lrm
-        for param_group in optimizer.param_groups:
-            param_group["lr"] = current_lr
-
-        # Optimizer step
-        optimizer.step()
-        optimizer.zero_grad()
-
-        # Fast fail
-        if train_loss > 100:
-            print("\nFAIL: loss exploded")
-            sys.exit(1)
-
-        torch.cuda.synchronize()
-        t1 = time.time()
-        dt = t1 - t0
-
-        # Don't count first 5 warmup steps (compilation overhead)
-        if step > 5:
-            total_training_time += dt
-
-        # Logging
-        ema_beta = 0.9
-        smooth_loss = ema_beta * smooth_loss + (1 - ema_beta) * train_loss
-        debiased_loss = smooth_loss / (1 - ema_beta ** (step + 1))
-        pct_done = 100 * progress
-        tok_per_sec = int(effective_batch_tokens / dt) if dt > 0 else 0
-        mfu = (
-            100 * flops_per_token * effective_batch_tokens / dt / GPU_BF16_PEAK_FLOPS
-            if dt > 0
-            else 0
-        )
-        remaining = max(0, TIME_BUDGET - total_training_time)
-        bpc = debiased_loss / math.log(2)
-
-        print(
-            f"\rstep {step:05d} ({pct_done:.1f}%) | loss: {debiased_loss:.6f} | bpc: {bpc:.4f} | lr: {current_lr:.2e} | dt: {dt * 1000:.0f}ms | tok/s: {tok_per_sec:,} | mfu: {mfu:.1f}% | remain: {remaining:.0f}s    ",
-            end="",
-            flush=True,
-        )
-
-        # Validation
-        if step % VALIDATE_EVERY == 0 and step > 0:
-            with precision_ctx:
-                val_bpc = evaluate_bpc(ar_model, val_loader)
-            print(f"\n  [val] bpc: {val_bpc:.4f}")
-
-        # Text generation
-        if step % GENERATE_EVERY == 0 and step > 0:
-            ar_model.eval()
-            inp = random.choice(val_dataset)[:-1]
-            prime = decode_tokens(inp)
-            print(f"\n  [gen] prompt: {prime[:80]}...")
-            with precision_ctx:
-                sample = ar_model.generate(
-                    prompts=inp.unsqueeze(0),
-                    seq_len=GENERATE_LENGTH,
-                    cache_kv=True,
-                )
-            output_str = decode_tokens(sample[0].tolist())
-            print(f"  [gen] output: {output_str[:200]}...")
-
-        # GC management
-        if step == 0:
-            gc.collect()
-            gc.freeze()
-            gc.disable()
-        elif (step + 1) % 5000 == 0:
-            gc.collect()
-
-        step += 1
-
-        # Time's up (only stop after warmup)
-        if step > 5 and total_training_time >= TIME_BUDGET:
+        elapsed = time.time() - t_start_train
+        if elapsed >= TIME_BUDGET:
             break
 
-    print()  # newline after \r
+        # Run one learning update (collects NUM_EPISODES_PER_UPDATE episodes,
+        # then does PPO_EPOCHS of gradient steps).
+        learner(env, 1)
+        num_updates += 1
+        total_episodes += NUM_EPISODES_PER_UPDATE
 
-    total_tokens = step * effective_batch_tokens
+        # Freeze GC after first update for speed
+        if not gc_frozen:
+            gc.disable()
+            gc_frozen = True
 
-    # Final eval
-    ar_model.eval()
-    with precision_ctx:
-        val_bpc = evaluate_bpc(ar_model, val_loader, num_eval_batches=100)
+        # Intermediate evaluation
+        if EVAL_INTERVAL > 0 and num_updates % EVAL_INTERVAL == 0:
+            mean_r, best_r = evaluate(
+                agent, ENV_NAME, num_eval_episodes=10, max_timesteps=MAX_TIMESTEPS
+            )
+            elapsed = time.time() - t_start_train
+            print(
+                f"[update {num_updates:4d} | {elapsed:5.0f}s] mean_reward={mean_r:.1f}  best={best_r:.0f}  episodes={total_episodes}"
+            )
+            if mean_r > best_eval_reward:
+                best_eval_reward = mean_r
 
-    # Final summary (matching Karpathy's output format for compatibility)
-    t_end = time.time()
-    peak_vram_mb = torch.cuda.max_memory_allocated() / 1024 / 1024
-    steady_state_mfu = (
-        (
-            100
-            * flops_per_token
-            * effective_batch_tokens
-            * max(1, step - 5)
-            / total_training_time
-            / GPU_BF16_PEAK_FLOPS
-        )
-        if total_training_time > 0
-        else 0
+    t_end_train = time.time()
+    env.close()
+
+    # Re-enable GC
+    if gc_frozen:
+        gc.enable()
+
+    training_seconds = t_end_train - t_start_train
+
+    peak_vram_mb = 0.0
+    if torch.cuda.is_available():
+        peak_vram_mb = torch.cuda.max_memory_allocated() / (1024 * 1024)
+
+    # -- Final evaluation (greedy policy, no exploration noise) --
+    mean_reward, best_reward = evaluate(
+        agent,
+        ENV_NAME,
+        num_eval_episodes=NUM_EVAL_EPISODES,
+        max_timesteps=MAX_TIMESTEPS,
     )
 
+    total_seconds = time.time() - t_start_total
+
+    # -- Summary block (parseable by grep) --
+    print()
+    print("training complete")
+    print()
     print("---")
-    print(f"val_bpc:          {val_bpc:.6f}")
-    print(f"training_seconds: {total_training_time:.1f}")
-    print(f"total_seconds:    {t_end - t_start:.1f}")
-    print(f"peak_vram_mb:     {peak_vram_mb:.1f}")
-    print(f"mfu_percent:      {steady_state_mfu:.2f}")
-    print(f"total_tokens_M:   {total_tokens / 1e6:.1f}")
-    print(f"num_steps:        {step}")
-    print(f"num_params_M:     {num_params / 1e6:.1f}")
-    print(f"depth:            {MODEL_DEPTH}")
-    print(f"precision:        {precision_tag}")
+    print(f"mean_reward:       {mean_reward:.4f}")
+    print(f"best_reward:       {best_reward:.4f}")
+    print(f"num_updates:       {num_updates}")
+    print(f"total_episodes:    {total_episodes}")
+    print(f"training_seconds:  {training_seconds:.1f}")
+    print(f"total_seconds:     {total_seconds:.1f}")
+    print(f"peak_vram_mb:      {peak_vram_mb:.1f}")
+    print(f"num_params_M:      {num_params / 1e6:.4f}")
+    print(f"hidden_dim:        {HIDDEN_DIM}")
+    print(f"world_model_depth: {WORLD_MODEL_DEPTH}")
 
 
 if __name__ == "__main__":

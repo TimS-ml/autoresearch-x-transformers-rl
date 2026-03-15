@@ -1,28 +1,25 @@
 # autoresearch-x-transformers-rl — Design Document
 
-This document records the architectural and implementation decisions made when
-extending the base `autoresearch-x-transformers` repository into the RL edition.
+This document records the architectural and implementation decisions for
+autonomous RL experimentation using Phil Wang's
+[x-transformers-rl](https://github.com/lucidrains/x-transformers-rl) library,
+following the [autoresearch](https://github.com/karpathy/autoresearch) pattern.
 
 ---
 
 ## 1. Scope and Goals
 
-The base repo is an autonomous experiment loop for **character-level language
-modelling** (enwik8, BPC metric, 5-minute training budget).  This extension adds
-a parallel loop for **reinforcement learning** using Phil Wang's
-[x-transformers-rl](https://github.com/lucidrains/x-transformers-rl) library.
+An autonomous experiment loop for **reinforcement learning** on classic control
+tasks. An AI agent modifies `train.py`, trains for 5 minutes, checks if the
+result improved, keeps or discards, and repeats.
 
 Key goals:
 
-- Keep the same autoresearch pattern: one editable file (`train_rl.py`), fixed
-  time budget, TSV logging, git-branch-per-run.
-- Use `x-transformers-rl` as a local submodule (read-only, like `x-transformers`).
-- Choose a benchmark environment that is:
-  - Fast enough to collect many episodes inside the time budget.
-  - Hard enough to show meaningful improvement across experiments.
-  - GPU-friendly (runs in Python, no display needed).
-- Expose the same kind of structured output block (`---`) so results can be
-  grepped and logged automatically.
+- One editable file (`train.py`), fixed 5-minute time budget, TSV logging,
+  git-branch-per-run.
+- `x-transformers-rl` as a local submodule (read-only).
+- Benchmark environment that is fast, non-trivial, and GPU-friendly.
+- Structured output block (`---`) for automated result extraction.
 
 ---
 
@@ -53,45 +50,48 @@ CartPole baseline exists.
 
 ---
 
-## 3. Training Script Design (`train_rl.py`)
-
-The script mirrors `train.py` in structure:
+## 3. Training Script Design (`train.py`)
 
 - Single file, all configuration at the top as named constants.
-- Fixed **episode budget** (not time budget) for comparability: 500 episodes
-  per run (~30 seconds on CartPole), configurable via `NUM_EPISODES`.
+- Fixed **5-minute wall clock** training time (`TIME_BUDGET = 300`).
+  The script runs as many `Learner` updates as fit in the time budget,
+  calling `learner(env, 1)` in a loop.
+- Intermediate evaluations are printed every `EVAL_INTERVAL` updates.
 - Output block at the end:
   ```
   ---
-  mean_reward:      123.45
-  best_reward:      456.78
-  total_episodes:   500
-  total_seconds:    32.1
-  peak_vram_mb:     1234.5
-  num_params_M:     0.12
-  world_model_dim:  48
-  world_model_depth: 1
+  mean_reward:       139.8333
+  best_reward:       500.0000
+  num_updates:       32
+  total_episodes:    800
+  training_seconds:  304.5
+  total_seconds:     305.2
+  peak_vram_mb:      96.6
+  num_params_M:      0.2647
+  hidden_dim:        64
+  world_model_depth: 2
   ```
-- Logs to `results_rl.tsv` (separate from the LM results).
+- Logs to `results.tsv`.
 
-**Why episode budget instead of time budget?**
-
-For RL the training time varies with:
-- Episode length (CartPole can end at step 1 or step 500).
-- Number of PPO epochs.
-- Model size.
-
-A fixed episode count gives more stable comparisons.  We use 500 episodes
-which completes in ~20-60s on CartPole with a small model on the 4090.
+The number of updates varies with model size and episode length (CartPole
+episodes can be 10–500 steps), which means more-capable agents actually
+collect fewer episodes but each episode is longer.  ~30–40 updates in
+5 minutes is typical.
 
 ---
 
 ## 4. World Model Architecture Defaults
 
-Starting configuration for `train_rl.py`:
+Starting configuration for `train.py`:
 
 ```python
-world_model = dict(
+HIDDEN_DIM         = 64
+WORLD_MODEL_DEPTH  = 2
+WORLD_MODEL_HEADS  = 4
+WORLD_MODEL_DIM_HEAD = 16
+REWARD_RANGE       = (0., 250.)
+
+WORLD_MODEL = dict(
     depth = 2,
     attn_gate_values = True,
     add_value_residual = True,
@@ -99,16 +99,24 @@ world_model = dict(
     learned_value_residual_mix = True,
     attn_flash = True,
 )
-agent_kwargs = dict(
+AGENT_KWARGS = dict(
+    hidden_dim = 64,                # must be set explicitly (Agent default is 48!)
     world_model_attn_dim_head = 16,
-    world_model_heads = 4,          # hidden_dim = 4 * 16 = 64
+    world_model_heads = 4,
     world_model_embed_linear_schedule = (5., 20.),
 )
 ```
 
-This is taken directly from `train_lander.py` with `depth` reduced from 4 to 2
-for speed on a trivial environment.  The hidden dim of 64 gives ~100K parameters
-total — small enough to train quickly, large enough to learn CartPole.
+**Key fix**: `hidden_dim` must be set explicitly via `agent_kwargs`.  The
+`Agent` default is only 48, but we want 64 (= 4 heads × 16 dim_head).
+
+**Key fix**: `REWARD_RANGE` must cover the expected discounted return range.
+CartPole gives +1/step with gamma=0.99 and max 500 steps, so returns are
+in roughly `(0, 200)`.  We use `(0, 250)`.  The previous default of `(-1, 1)`
+broke the HL-Gauss distributional critic and prevented learning.
+
+Architecture: ~265K parameters, enough to learn CartPole but small enough
+for fast training (~2.5s per update with 25 episodes).
 
 ---
 
@@ -149,26 +157,45 @@ gymnasium API.
 **Fix:** `float(np.asarray(reward).flat[0])` — works for 0-d arrays, scalars,
 and 1-element arrays.
 
+### 5.3 `Learner.forward` — truncation bootstrap memory appended to wrong list
+
+**File:** `x-transformers-rl/x_transformers_rl/x_transformers_rl.py`, line ~3090
+
+**Bug:** When an episode is **truncated** (time limit hit, not terminated), the
+code creates a bootstrap Memory for GAE value estimation.  This memory was
+appended to the outer `memories` list (which is a list of lists) instead of
+to `one_episode_memories` (the inner list for the current episode).  This
+caused `learn()` to crash with `TypeError: iteration over a 0-d tensor`
+when trying to unpack the bare Memory tuple as if it were a list of Memories.
+
+The bug only triggers when the agent gets good enough that episodes reach
+the maximum timestep (500 for CartPole), causing truncation.
+
+**Fix:** Changed `memories.append(bootstrap_value_memory)` to
+`one_episode_memories.append(bootstrap_value_memory)`.
+
 ---
 
-## 6. Autoresearch Protocol for RL
+## 6. Autoresearch Protocol
 
-See `AGENTS_RL.md` for the full machine-specific protocol.
+See `AGENTS.md` for the full machine-specific protocol.
 
-Key differences from the LM autoresearch:
+| | This repo |
+|---|---|
+| Metric | mean_reward (higher = better) |
+| Budget | 5-minute wall clock |
+| Environment | CartPole-v1 (stochastic env) |
+| Editable file | `train.py` |
+| Results log | `results.tsv` |
 
-| | LM (`train.py`) | RL (`train_rl.py`) |
-|---|---|---|
-| Metric | val_bpc (lower = better) | mean_reward (higher = better) |
-| Budget | 5-minute wall clock | 500 episodes |
-| Environment | enwik8 (fixed dataset) | CartPole-v1 (stochastic env) |
-| Variance | Low (deterministic data) | High (stochastic rollouts) |
-| Editable file | `train.py` | `train_rl.py` |
-| Results log | `results.tsv` | `results_rl.tsv` |
+**Variance handling:** RL experiments have high variance.
+A result should only be kept if it improves by more than ~10 reward units over
+the current best, to avoid chasing noise.
 
-**Variance handling:** RL experiments have higher variance than LM experiments.
-A result should only be kept if it improves by more than ~5 reward units over
-the baseline, to avoid chasing noise.
+**Baseline results** (5-minute runs on RTX 4090):
+- Baseline config: mean_reward ≈ 120–140 (high variance)
+- CartPole-v1 is "solved" at mean_reward ≥ 475
+- Plenty of room for improvement via architecture, hyperparameters, and training config
 
 ---
 
@@ -196,7 +223,7 @@ space.  Most-impactful parameters (ordered by expected impact):
 |---|---|---|---|
 | `lr` | Learning rate | 8e-4 | 3e-4, 1e-3, 3e-3 |
 | `epochs` | PPO epochs per update | 3 | 1, 5, 10 |
-| `batch_size` | Mini-batch size | 8 | 4, 16, 32 |
+| `batch_size` | Mini-batch size | 5 | 10, 25 |
 | `gamma` | Discount factor | 0.99 | 0.95, 0.999 |
 | `lam` | GAE lambda | 0.95 | 0.9, 0.98 |
 | `entropy_weight` | Exploration bonus | 0.01 | 0.001, 0.1 |
@@ -219,20 +246,16 @@ space.  Most-impactful parameters (ordered by expected impact):
 
 ```
 autoresearch-x-transformers-rl/
-├── train.py             — LM autoresearch (existing, unchanged)
-├── train_rl.py          — RL autoresearch (new, agent edits this)
-├── results.tsv          — LM experiment log (untracked)
-├── results_rl.tsv       — RL experiment log (untracked)
-├── AGENTS.md            — LM machine-specific protocol
-├── AGENTS_RL.md         — RL machine-specific protocol (new)
+├── train.py             — RL autoresearch (agent edits this)
+├── results.tsv          — experiment log (untracked)
+├── AGENTS.md            — machine-specific protocol (not committed)
 ├── docs/
 │   ├── design.md        — this file
-│   ├── adjustable_params_basemodel.md
-│   └── adjustable_params_basemodel_v2.md
-├── x-transformers/      — LM library submodule (read-only)
+│   └── adjustable_params.md — x-transformers-rl parameter reference
+├── x-transformers/      — x-transformers library submodule (read-only)
 └── x-transformers-rl/   — RL library submodule (read-only)
     ├── x_transformers_rl/
-    │   ├── x_transformers_rl.py   — core (fixed 2 bugs, see §5)
+    │   ├── x_transformers_rl.py   — core (fixed 3 bugs, see §5)
     │   ├── evolution.py           — evolutionary gene pool
     │   └── distributed.py        — DDP utilities
     └── train_lander.py            — reference LunarLander example

@@ -1,23 +1,19 @@
 [project]
-name = "autoresearch"
-version = "0.2.0"
-description = "Autonomous LLM-driven research on character-level language modeling with x-transformers"
+name = "autoresearch-x-transformers-rl"
+version = "0.1.0"
+description = "Autonomous LLM-driven research on RL with x-transformers-rl"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
     "torch>=2.0",
     "numpy",
-    "matplotlib",
-    "pandas",
-    "loguru",
+    "gymnasium",
     "einx",
+    "einops",
     "ema-pytorch",
     "adam-atan2-pytorch",
-    "x-transformers @ git+https://github.com/TimS-ml/x-transformers.git",
-    "torchao>=0.16.0",
-]
-
-[project.optional-dependencies]
-analysis = [
-    "jupytext",
+    "hl-gauss-pytorch",
+    "assoc-scan",
+    "x-mlps-pytorch",
+    "accelerate",
 ]

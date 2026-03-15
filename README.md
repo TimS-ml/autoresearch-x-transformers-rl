@@ -1,55 +1,47 @@
-Autonomous LLM-driven research on character-level language modeling using my fork of [x-transformers](https://github.com/TimS-ml/x-transformers). Runs on any NVIDIA GPU with >= 8 GB VRAM. FP8 training supported on Ada Lovelace / Hopper / Blackwell GPUs via [torchao](https://github.com/pytorch/ao).
+Autonomous LLM-driven research on reinforcement learning using my fork of [x-transformers-rl](https://github.com/TimS-ml/x-transformers-rl). A transformer world model learns to play CartPole-v1 via PPO, and an AI agent iterates on the architecture and hyperparameters overnight.
 
-![teaser](progress.png)
-
-![memory_usage](memory.png)
-
-# autoresearch (x-transformers edition)
+# autoresearch (x-transformers-rl edition)
 
 *One day, frontier AI research used to be done by meat computers in between eating, sleeping, having other fun, and synchronizing once in a while using sound wave interconnect in the ritual of "group meeting". That era is long gone. Research is now entirely the domain of autonomous swarms of AI agents running across compute cluster megastructures in the skies. The agents claim that we are now in the 10,205th generation of the code base, in any case no one could tell if that's right or wrong as the "code" is now a self-modifying binary that has grown beyond human comprehension. This repo is the story of how it all began. -@karpathy, March 2026*.
 
-The idea: give an AI agent a small but real LLM training setup and let it experiment autonomously overnight. It modifies the code, trains for 5 minutes, checks if the result improved, keeps or discards, and repeats. You wake up in the morning to a log of experiments and (hopefully) a better model. This edition uses Phil Wang's [x-transformers](https://github.com/lucidrains/x-transformers) library, which provides a rich set of transformer architectural features to explore. The core idea is the same as [Karpathy's autoresearch](https://github.com/karpathy/autoresearch) — you program the `program.md` Markdown file that provides context to the AI agent.
+The idea: give an AI agent a small but real RL training setup and let it experiment autonomously overnight. It modifies the code, trains for 5 minutes, checks if the result improved, keeps or discards, and repeats. You wake up in the morning to a log of experiments and (hopefully) a better agent. This edition uses Phil Wang's [x-transformers-rl](https://github.com/lucidrains/x-transformers-rl) library — a causal Transformer world model with PPO actor-critic heads — and the same autonomous loop from [Karpathy's autoresearch](https://github.com/karpathy/autoresearch).
 
 ## How it works
 
 The repo has a few key files:
 
-- **`train.py`** — the single file the agent edits. Contains the x-transformers model (TransformerWrapper + Decoder + AutoregressiveWrapper), optimizer (MuonAdamAtan2), and training loop. Everything is fair game: architecture, hyperparameters, optimizer, batch size, etc. **This file is edited and iterated on by the agent**.
+- **`train.py`** — the single file the agent edits. Contains the x-transformers-rl Learner config (world model architecture, PPO hyperparameters, training loop). Everything is fair game. **This file is edited and iterated on by the agent**.
 - **`program.md`** — instructions for the agent. Point your agent here and let it go. **This file is edited and iterated on by the human**.
-- **`AGENTS.md`** — detailed experiment protocol including hardware specs, x-transformers parameter space guide, model sizing rules, and experiment ideas.
-- **`docs/adjustable_params.md`** — comprehensive reference of all adjustable x-transformers parameters with descriptions and paper links.
-- **`x-transformers/`** — the x-transformers library (git submodule, read-only reference).
+- **`AGENTS.md`** — machine-specific overrides (GPU, Python path, etc.). Not committed — customized per machine.
+- **`docs/adjustable_params.md`** — comprehensive reference of all adjustable x-transformers-rl parameters.
+- **`docs/design.md`** — design decisions, bug fixes, and parameter search space.
+- **`x-transformers-rl/`** — the RL library (git submodule, read-only reference).
+- **`x-transformers/`** — the base transformer library (git submodule, read-only reference).
 
-Dataset: **enwik8** (character-level, 256 vocab, 90M train / 5M val). Metric: **val_bpc** (validation bits per character) — lower is better.
+Environment: **CartPole-v1** (gymnasium). Metric: **mean_reward** — higher is better. Solved at 475+.
 
-By design, training runs for a **fixed 5-minute time budget** (wall clock, excluding startup/compilation), regardless of your hardware. This makes experiments directly comparable.
+By design, training runs for a **fixed 5-minute time budget** (wall clock). This makes experiments directly comparable.
 
 ## Quick start
 
-**Requirements:** A single NVIDIA GPU (>= 8 GB VRAM), Python 3.10+. Any package manager works (uv / conda / mamba / pip).
+**Requirements:** A single NVIDIA GPU, Python 3.10+. Any package manager works (uv / conda / mamba / pip).
 
 ```bash
 # 1. Clone the repo
-git clone --recursive https://github.com/TimS-ml/autoresearch-x-transformers
-cd autoresearch-x-transformers
+git clone --recursive https://github.com/TimS-ml/autoresearch-x-transformers-rl
+cd autoresearch-x-transformers-rl
 
-# 2. Install dependencies (pick one)
-uv sync                  # uv (recommended)
-# or: pip install -e .   # pip / conda / mamba
+# 2. Install dependencies
+pip install gymnasium hl-gauss-pytorch assoc-scan x-mlps-pytorch \
+    accelerate adam-atan2-pytorch ema-pytorch einx einops
 
-# 3. Verify data exists
-ls x-transformers/data/enwik8.gz
+# 3. Verify imports work
+python -c "from x_transformers_rl import Learner; print('OK')"
+python -c "import gymnasium; print('OK')"
 
-# 4. Verify imports work
-python -c "from x_transformers import TransformerWrapper; print('OK')"
-
-# 5. Run a single training experiment (~5 min)
-python train.py                  # BF16 (default)
-USE_FP8=1 python train.py       # FP8 via torchao (Ada Lovelace+ GPUs)
-USE_FP16=1 python train.py      # FP16
+# 4. Run a single training experiment (~5 min)
+CUDA_VISIBLE_DEVICES=0 python train.py
 ```
-
-FP8 requires an **Ada Lovelace / Hopper / Blackwell** GPU (RTX 40xx, A100, H100, etc.) and is handled by [torchao](https://github.com/pytorch/ao) (included in dependencies). If you don't have a compatible GPU, just skip `USE_FP8=1` — BF16 (the default) works on any NVIDIA GPU.
 
 ## Running the agent
 
@@ -59,30 +51,42 @@ Spin up your Claude/Codex or whatever you want in this repo, then prompt:
 Hi have a look at program.md and let's kick off a new experiment!
 ```
 
-The `program.md` file is the "skill" that drives the autonomous agent. `AGENTS.md` provides the full protocol.
+The `program.md` file is the "skill" that drives the autonomous agent. `AGENTS.md` provides machine-specific overrides.
 
 ## Project structure
 
 ```
-train.py                — model, optimizer, training loop (agent modifies this)
-program.md              — agent instructions
-analysis.ipynb          — generated notebook from analysis.py
+train.py                    — Learner config, PPO hyperparameters, training loop (agent modifies this)
+program.md                  — agent instructions (public)
+AGENTS.md                   — machine-specific overrides (private, not committed)
+analysis.py                 — experiment analysis script (jupytext percent format)
 docs/
-  adjustable_params.md  — x-transformers parameter reference
-x-transformers/         — x-transformers library (git submodule, read-only)
+  adjustable_params.md      — x-transformers-rl parameter reference
+  design.md                 — design decisions and bug log
+x-transformers-rl/          — RL library (git submodule, read-only)
+x-transformers/             — base transformer library (git submodule, read-only)
 ```
 
 ## Design choices
 
-- **x-transformers as the model backbone.** Phil Wang's library provides 50+ architectural options (GLU, RoPE, GQA, macaron, sandwich norm, etc.) — a huge search space for the agent to explore. The agent only touches `train.py` to configure these options.
-- **Character-level enwik8.** No tokenizer needed. 256-vocab byte-level, so BPC (bits per character) is the natural metric. Simple and fast.
-- **Fixed time budget.** Training always runs for exactly 5 minutes. This makes experiments directly comparable regardless of what the agent changes. ~12 experiments/hour, ~100 overnight.
-- **Self-contained.** One GPU, one file, one metric. The x-transformers submodule provides the model; everything else is standard PyTorch.
+- **x-transformers-rl as the backbone.** Phil Wang's library wraps a causal Transformer world model with PPO actor-critic heads, distributional critic (HL-Gauss), curiosity rewards, evolutionary gene pools, and more — a huge search space for the agent.
+- **CartPole-v1.** Fast (thousands of steps/second), well-defined solved score (475+), trivial to install (no Box2D). Isolates RL algorithm differences from model capacity.
+- **Fixed 5-minute time budget.** Training always runs for exactly 5 minutes. ~12 experiments/hour, ~100 overnight.
+- **Self-contained.** One GPU, one file, one metric. The submodules provide the model; everything else is standard PyTorch + gymnasium.
+
+## Bug fixes in x-transformers-rl
+
+Three bugs were found and fixed in the local fork (see `docs/design.md` §5 for details):
+
+1. **SPO/PPO condition inversion** — `if not self.use_spo` had the SPO and PPO code blocks swapped.
+2. **Non-scalar reward crash** — `float(reward)` fails on 1-element numpy arrays from some environments.
+3. **Truncation bootstrap crash** — bootstrap memory for GAE was appended to the wrong list, crashing when episodes hit the time limit.
 
 ## Credits
 
 - [Karpathy's autoresearch](https://github.com/karpathy/autoresearch) — the original concept
-- [Phil Wang's x-transformers](https://github.com/lucidrains/x-transformers) here is [my fork](https://github.com/TimS-ml/x-transformers) — the model library
+- [Phil Wang's x-transformers-rl](https://github.com/lucidrains/x-transformers-rl) here is [my fork](https://github.com/TimS-ml/x-transformers-rl) — the RL library
+- [Phil Wang's x-transformers](https://github.com/lucidrains/x-transformers) here is [my fork](https://github.com/TimS-ml/x-transformers) — the base transformer library
 
 ## License
 
