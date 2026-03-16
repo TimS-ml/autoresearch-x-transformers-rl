@@ -5,12 +5,13 @@ This is the RL counterpart of train.py.  The agent modifies this file to
 experiment with different world-model architectures, PPO hyperparameters, and
 training configurations.
 
-Environment: CartPole-v1 (gymnasium)
-  - Observation: 4-dim continuous state vector.
-  - Action: 2 discrete actions (push left / push right).
-  - Reward: +1 per timestep the pole stays upright.
-  - Solved: mean episode reward >= 475 over 100 consecutive episodes.
-  - Max episode length: 500 steps.
+Environment: LunarLander-v3 (gymnasium)
+  - Observation: 8-dim continuous state vector (x, y, vx, vy, angle, angular
+    velocity, left leg contact, right leg contact).
+  - Action: 4 discrete actions (do nothing, fire left, fire main, fire right).
+  - Reward: shaped — hover/land near pad = positive, crash/fuel = negative.
+  - Solved: mean episode reward >= 200 over 100 consecutive episodes.
+  - Max episode length: 1000 steps.
 
 Metric: mean_reward (higher is better), evaluated greedily after training.
 
@@ -39,6 +40,7 @@ import sys
 import os
 import time
 import gc
+import random
 
 # ---------------------------------------------------------------------------
 # Path setup — pick up the local submodules first
@@ -51,22 +53,26 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "x-transformers"))
 # Hyperparameters — everything the agent may tune
 # ---------------------------------------------------------------------------
 
+# --- Reproducibility ---
+SEED = 42  # Global seed for torch, numpy, random, gymnasium
+
 # --- Time budget ---
 TIME_BUDGET = 300  # 5-minute wall clock training time (seconds)
 
 # --- Environment ---
-ENV_NAME = "CartPole-v1"
-MAX_TIMESTEPS = 500  # Max steps per episode (gymnasium default)
+ENV_NAME = "LunarLander-v3"
+MAX_TIMESTEPS = 1000  # Max steps per episode (LunarLander default)
 
 # --- Critic value range ---
-# CartPole gives +1 per step.  With gamma=0.99 and max 500 steps, the
-# discounted return ranges roughly from 0 to ~200.  We give the HL-Gauss
-# distributional critic a wide enough range to cover this.
-REWARD_RANGE = (0.0, 250.0)
+# LunarLander rewards: landing ~100-140, crash ~-100, fuel cost ~-50.
+# With gamma=0.99, discounted returns roughly in (-200, 300).
+# We clip observed rewards to [-5, 5] (following upstream train_lander.py)
+# so the critic range covers the clipped return distribution.
+REWARD_RANGE = (-5.0, 5.0)
 
 # --- World model architecture ---
 HIDDEN_DIM = 64  # Transformer residual-stream dimension
-WORLD_MODEL_DEPTH = 2  # Number of transformer layers
+WORLD_MODEL_DEPTH = 4  # Number of transformer layers (deeper for LunarLander)
 WORLD_MODEL_HEADS = 4  # Number of attention heads
 WORLD_MODEL_DIM_HEAD = 16  # Per-head dimension
 
@@ -103,7 +109,7 @@ AGENT_KWARGS = dict(
     hidden_dim=HIDDEN_DIM,
     world_model_attn_dim_head=WORLD_MODEL_DIM_HEAD,
     world_model_heads=WORLD_MODEL_HEADS,
-    world_model_attn_hybrid_gru=False,
+    world_model_attn_hybrid_gru=True,
     world_model_embed_linear_schedule=WORLD_MODEL_EMBED_SCHEDULE,
     actor_critic_world_model=dict(
         frac_critic_head_gradient=5e-2,
@@ -128,6 +134,23 @@ import gymnasium as gym
 from x_transformers_rl import Learner
 
 # ---------------------------------------------------------------------------
+# Reproducibility: seed everything
+# ---------------------------------------------------------------------------
+
+
+def seed_everything(seed: int):
+    """Seed Python, NumPy, PyTorch, and CUDA for reproducibility."""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    # Deterministic cuDNN (slight perf cost, better reproducibility)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+
+# ---------------------------------------------------------------------------
 # Helper: count model parameters
 # ---------------------------------------------------------------------------
 
@@ -142,19 +165,20 @@ def count_params(model):
 
 
 @torch.no_grad()
-def evaluate(agent, env_name, num_eval_episodes=30, max_timesteps=500):
+def evaluate(agent, env_name, num_eval_episodes=30, max_timesteps=1000, seed=None):
     """Run the agent greedily and return (mean_reward, best_reward)."""
     agent.eval()
     rewards = []
     eval_env = gym.make(env_name)
 
-    for _ in range(num_eval_episodes):
-        obs, _ = eval_env.reset()
+    for ep in range(num_eval_episodes):
+        ep_seed = (seed + ep) if seed is not None else None
+        obs, _ = eval_env.reset(seed=ep_seed)
         hiddens = None
         episode_reward = 0.0
         for _ in range(max_timesteps):
             raw_actions, hiddens = agent(obs, hiddens=hiddens)
-            # Greedy action selection
+            # Greedy action selection (works for any discrete action count)
             action = raw_actions.argmax().item()
             obs, reward, terminated, truncated, *_ = eval_env.step(action)
             episode_reward += float(reward)
@@ -174,10 +198,13 @@ def evaluate(agent, env_name, num_eval_episodes=30, max_timesteps=500):
 def main():
     t_start_total = time.time()
 
+    # -- Seed everything for reproducibility --
+    seed_everything(SEED)
+
     # -- Environment --
     env = gym.make(ENV_NAME)
-    state_dim = env.observation_space.shape[0]  # 4 for CartPole
-    num_actions = env.action_space.n  # 2 for CartPole
+    state_dim = env.observation_space.shape[0]  # 8 for LunarLander
+    num_actions = env.action_space.n  # 4 for LunarLander
 
     # -- Learner (world model + actor + critic + PPO) --
     learner = Learner(
@@ -237,7 +264,11 @@ def main():
         # Intermediate evaluation
         if EVAL_INTERVAL > 0 and num_updates % EVAL_INTERVAL == 0:
             mean_r, best_r = evaluate(
-                agent, ENV_NAME, num_eval_episodes=10, max_timesteps=MAX_TIMESTEPS
+                agent,
+                ENV_NAME,
+                num_eval_episodes=10,
+                max_timesteps=MAX_TIMESTEPS,
+                seed=SEED + 10000 + num_updates,
             )
             elapsed = time.time() - t_start_train
             print(
@@ -265,6 +296,7 @@ def main():
         ENV_NAME,
         num_eval_episodes=NUM_EVAL_EPISODES,
         max_timesteps=MAX_TIMESTEPS,
+        seed=SEED + 20000,
     )
 
     total_seconds = time.time() - t_start_total

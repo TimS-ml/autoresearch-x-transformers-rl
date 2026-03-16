@@ -7,8 +7,13 @@ learning using [x-transformers-rl](https://github.com/lucidrains/x-transformers-
 
 To set up a new experiment, work with the user to:
 
-1. **Agree on a run tag**: propose a tag based on today's date (e.g. `mar15-rl`). The branch `autoresearch/<tag>` must not already exist — this is a fresh run.
-2. **Create the branch**: `git checkout -b autoresearch/<tag>` from current HEAD.
+1. **Agree on a run tag**: propose a tag based on today's date (e.g. `mar15-rl`). The branches `autoresearch/<tag>-{a,b,c}` must not already exist — this is a fresh run.
+2. **Create the branches**: Create 3 population branches from current HEAD (see "Population Search" section below):
+   ```bash
+   git checkout -b autoresearch/<tag>-a
+   git checkout -b autoresearch/<tag>-b
+   git checkout -b autoresearch/<tag>-c
+   ```
 3. **Read the in-scope files**: The repo is small. Read these files for full context:
    - `AGENTS.md` — **machine-specific overrides** (Python path, GPU, etc.). Always read this first and follow its settings. This file is not committed — it is customized per machine.
    - `train.py` — the file you modify. World-model config, PPO hyperparameters, training loop.
@@ -18,9 +23,9 @@ To set up a new experiment, work with the user to:
    - `x-transformers-rl/train_lander.py` — reference LunarLander training script with annotations.
 4. **Verify dependencies**: Run `python -c "from x_transformers_rl import Learner; print('OK')"` and `python -c "import gymnasium; print('OK')"`. If missing deps, install:
    ```bash
-   pip install gymnasium hl-gauss-pytorch assoc-scan x-mlps-pytorch accelerate adam-atan2-pytorch ema-pytorch einx einops
+    pip install "gymnasium[box2d]" hl-gauss-pytorch assoc-scan x-mlps-pytorch accelerate adam-atan2-pytorch ema-pytorch einx einops
    ```
-5. **Initialize results.tsv**: Create `results.tsv` with just the header row. The baseline will be recorded after the first run.
+5. **Initialize results files**: Create `results-a.tsv`, `results-b.tsv`, `results-c.tsv` with just the header row each. The baseline will be recorded after the first run on each branch.
 6. **Confirm and go**: Confirm setup looks good.
 
 Once you get confirmation, kick off the experimentation.
@@ -29,9 +34,13 @@ Once you get confirmation, kick off the experimentation.
 
 Each experiment runs on a single GPU. The training script runs for a **fixed time budget of 5 minutes** (300 seconds wall clock training time). The script runs as many learning updates as fit in the time budget, then does a final greedy evaluation.
 
+**All runs must use the `timeout` wrapper** to guarantee hard-kill at 300 seconds (5 minutes). This prevents hung processes from blocking the experiment loop:
+
 ```bash
-python train.py > run.log 2>&1
+timeout 300 python train.py > run.log 2>&1
 ```
+
+If `timeout` kills the process (exit code 124), treat it as a crash — log `crash` status with `mean_reward=0.0000` and move on.
 
 **What you CAN do:**
 - Modify `train.py` — this is the only file you edit. Everything is fair game: world-model architecture, PPO hyperparameters, agent config, training loop, etc.
@@ -40,7 +49,7 @@ python train.py > run.log 2>&1
 - Modify files inside `x-transformers-rl/` or `x-transformers/`. The libraries are read-only reference.
 - Break the output format (the `---` summary block at the end must remain parseable).
 
-**The goal: get the highest mean_reward on CartPole-v1 in 5 minutes.** CartPole-v1 is "solved" at 475+ mean reward over 100 consecutive episodes. The baseline gets ~120-140 mean_reward; there is substantial room for improvement.
+**The goal: get the highest mean_reward on LunarLander-v3 in 5 minutes.** LunarLander-v3 is "solved" at 200+ mean reward over 100 consecutive episodes. The environment has 8-dim observations, 4 discrete actions, and shaped rewards (landing near pad = positive, crash/fuel = negative). There is substantial room for improvement.
 
 **Variance**: RL training is noisier than supervised learning. A result should only be kept if it improves by **more than ~10 reward units** over the current best, to avoid chasing noise.
 
@@ -54,16 +63,16 @@ Once the script finishes it prints a summary like this:
 
 ```
 ---
-mean_reward:       139.8333
-best_reward:       500.0000
-num_updates:       33
-total_episodes:    825
-training_seconds:  304.7
-total_seconds:     310.2
-peak_vram_mb:      118.4
-num_params_M:      0.2647
+mean_reward:       -120.5000
+best_reward:       45.3000
+num_updates:       20
+total_episodes:    500
+training_seconds:  298.5
+total_seconds:     305.2
+peak_vram_mb:      150.4
+num_params_M:      0.4200
 hidden_dim:        64
-world_model_depth: 2
+world_model_depth: 4
 ```
 
 You can extract key metrics from the log file:
@@ -92,9 +101,9 @@ Example:
 
 ```
 commit	mean_reward	memory_gb	status	description
-a1b2c3d	139.8333	0.1	keep	baseline (dim=64 depth=2 heads=4 5min)
-b2c3d4e	200.5000	0.1	keep	depth=3 epochs=5
-c3d4e5f	120.1000	0.1	discard	lr=1e-3 (worse than baseline)
+a1b2c3d	-120.5000	0.1	keep	baseline (dim=64 depth=4 heads=4 5min LunarLander)
+b2c3d4e	-80.3000	0.2	keep	depth=6 epochs=5
+c3d4e5f	-150.1000	0.1	discard	lr=1e-3 (worse than baseline)
 d4e5f6g	0.0000	0.0	crash	batch_size doesn't divide num_episodes_per_update
 ```
 
@@ -107,7 +116,7 @@ LOOP FOREVER:
 1. Look at the git state: the current branch/commit we're on
 2. Tune `train.py` with an experimental idea by directly hacking the code.
 3. git commit
-4. Run the experiment: `python train.py > run.log 2>&1` (redirect everything — do NOT use tee or let output flood your context)
+4. Run the experiment: `timeout 300 python train.py > run.log 2>&1` (redirect everything — do NOT use tee or let output flood your context; timeout auto-kills at 300s)
 5. Read out the results: `grep "^mean_reward:\|^peak_vram_mb:" run.log`
 6. If the grep output is empty, the run crashed. Run `tail -n 50 run.log` to read the Python stack trace and attempt a fix. If you can't get things to work after more than a few attempts, give up.
 7. Record the results in the tsv (NOTE: do not commit the results.tsv file, leave it untracked by git)
@@ -116,13 +125,85 @@ LOOP FOREVER:
 
 The idea is that you are a completely autonomous researcher trying things out. If they work, keep. If they don't, discard. And you're advancing the branch so that you can iterate. If you feel like you're getting stuck in some way, you can rewind but you should probably do this very very sparingly (if ever).
 
-**Timeout**: Each experiment takes ~5.5 minutes total (5 min training + eval). If a run exceeds 10 minutes, kill it and treat it as a failure (discard and revert).
+**Timeout**: The `timeout 300` wrapper hard-kills runs at 5 minutes. If a run is killed by timeout (exit code 124), treat it as a crash — log it and revert. No manual killing needed.
 
 **Crashes**: If a run crashes (OOM, or a bug, or etc.), use your judgment: If it's something dumb and easy to fix (e.g. a typo, a missing import), fix it and re-run. If the idea itself is fundamentally broken, just skip it, log "crash" as the status in the tsv, and move on.
 
 **NEVER STOP**: Once the experiment loop has begun (after the initial setup), do NOT pause to ask the human if you should continue. Do NOT ask "should I keep going?" or "is this a good stopping point?". The human might be asleep, or gone from a computer and expects you to continue working *indefinitely* until you are manually stopped. You are autonomous. If you run out of ideas, think harder — read `docs/adjustable_params.md` and the x-transformers-rl source for new angles, try combining previous near-misses, try more radical architectural changes. The loop runs until the human interrupts you, period.
 
 As an example use case, a user might leave you running while they sleep. If each experiment takes you ~5 minutes then you can run approx 12/hour, for a total of about 100 over the duration of the average human sleep. The user then wakes up to experimental results, all completed by you while they slept!
+
+## Population Search (Multi-Branch)
+
+A single greedy ratchet can get stuck in local optima — for example, a sequence of small optimizer tweaks may prevent the agent from discovering that a completely different architecture would be better. To escape local optima, this repo uses **population-based multi-branch search**.
+
+### How it works
+
+Instead of one branch, maintain **3 parallel branches** (a population of size 3):
+
+```
+autoresearch/<tag>-a    ← branch A (e.g. optimizer-focused)
+autoresearch/<tag>-b    ← branch B (e.g. architecture-focused)
+autoresearch/<tag>-c    ← branch C (e.g. exploration/regularization-focused)
+```
+
+Each branch runs the standard greedy ratchet independently. Periodically, the best ideas from one branch are **migrated** (cherry-picked) to the others.
+
+### Setup
+
+During the setup phase (step 1-2), create all 3 branches from the same HEAD:
+
+```bash
+git checkout -b autoresearch/<tag>-a
+git checkout -b autoresearch/<tag>-b
+git checkout -b autoresearch/<tag>-c
+```
+
+Initialize a separate `results-<branch>.tsv` for each branch (e.g. `results-a.tsv`).
+
+### Rotation schedule
+
+Run experiments in **round-robin** across branches:
+
+1. Switch to branch A, run 3-5 experiments
+2. Switch to branch B, run 3-5 experiments
+3. Switch to branch C, run 3-5 experiments
+4. **Migration check** (see below)
+5. Repeat
+
+### Migration (cross-pollination)
+
+After every full rotation (every ~10-15 experiments), check if any branch has a substantially better `mean_reward` than the others. If so, **migrate** the winning improvement:
+
+1. Identify the best branch and its most impactful recent commit(s).
+2. On each lagging branch, `git cherry-pick <commit>` the winning change.
+3. Run a validation experiment on the receiving branch to confirm it helps there too.
+4. If the cherry-pick conflicts or doesn't improve, discard it — the branches have diverged too much in that dimension, and that's fine.
+
+### Convergence
+
+When two or more branches converge to similar scores and similar code, **merge** them:
+
+```bash
+git checkout autoresearch/<tag>-a
+git merge autoresearch/<tag>-b
+```
+
+This reduces the population back to fewer branches, concentrating search on the most promising direction.
+
+### Branch specialization (optional)
+
+To maximize diversity, you can seed each branch with a different initial focus:
+
+- **Branch A**: Start by exploring optimizer and learning rate changes.
+- **Branch B**: Start by exploring model architecture (depth, width, attention variants).
+- **Branch C**: Start by exploring training dynamics (episodes per update, PPO epochs, entropy, curiosity).
+
+This is not mandatory — the branches can explore freely — but initial specialization helps ensure the population covers different regions of the search space.
+
+### Tracking
+
+The `results-<branch>.tsv` files are all untracked (like `results.tsv`). When reporting to the user, summarize the best score across all branches and which branch is leading.
 
 ## x-transformers-rl Parameter Space
 
@@ -132,7 +213,7 @@ The x-transformers-rl library wraps a causal Transformer world model with PPO ac
 
 | Parameter | Type | Description | Default |
 |---|---|---|---|
-| `depth` | int | Number of transformer layers | 2 |
+| `depth` | int | Number of transformer layers | 4 |
 | `attn_gate_values` | bool | Gate attention values with a learned scalar | True |
 | `add_value_residual` | bool | ResFormer value residual connections | True |
 | `ff_relu_squared` | bool | ReLU^2 activation (Primer) | True |
@@ -160,7 +241,7 @@ The x-transformers-rl library wraps a causal Transformer world model with PPO ac
 | `hidden_dim` | 64 | Transformer residual-stream dimension. **Must be set explicitly** (Agent default is only 48) |
 | `world_model_attn_dim_head` | 16 | Per-head Q/K/V dimension |
 | `world_model_heads` | 4 | Number of attention heads |
-| `world_model_attn_hybrid_gru` | False | Hybrid GRU + attention mechanism |
+| `world_model_attn_hybrid_gru` | True | Hybrid GRU + attention mechanism |
 
 ### PPO / Training Hyperparameters
 
@@ -187,7 +268,7 @@ The x-transformers-rl library wraps a causal Transformer world model with PPO ac
 ### Key Constraints
 
 - `BATCH_SIZE` must divide `NUM_EPISODES_PER_UPDATE`
-- `REWARD_RANGE` must cover the expected discounted return range (CartPole: ~0 to 200)
+- `REWARD_RANGE` must cover the clipped reward range (LunarLander: -5 to 5)
 - `HIDDEN_DIM` must be passed explicitly via `agent_kwargs` (Agent default is only 48)
 
 ## Experiment Ideas (Prioritized)
@@ -196,15 +277,15 @@ Start with baseline, then try roughly in this order:
 
 ### Quick Wins
 1. **More PPO epochs**: `PPO_EPOCHS=5` (more gradient steps per update)
-2. **Deeper world model**: `WORLD_MODEL_DEPTH=3` (more capacity)
+2. **Deeper world model**: `WORLD_MODEL_DEPTH=6` (more capacity)
 3. **Larger hidden dim**: `HIDDEN_DIM=96` with `WORLD_MODEL_HEADS=6`
 4. **More episodes per update**: `NUM_EPISODES_PER_UPDATE=50, BATCH_SIZE=10`
 5. **Tune learning rate**: Try `LEARNING_RATE=3e-4` or `1.5e-3`
-6. **Wider reward range**: `REWARD_RANGE=(0., 500.)` (covers full episode return)
+6. **Wider reward range**: `REWARD_RANGE=(-10., 10.)` (wider clipped return coverage)
 
 ### Architecture Changes
 7. Add `ff_glu=True, ff_swish=True` in WORLD_MODEL (SwiGLU)
-8. Try `world_model_attn_hybrid_gru=True` (GRU + attention hybrid)
+8. Try `world_model_attn_hybrid_gru=False` (disable GRU, pure attention)
 9. Enable `add_entropy_to_advantage=True` (Cheng et al. entropy-augmented)
 10. Enable `use_simple_policy_optimization=True` (SPO instead of PPO)
 11. Tune `world_model_embed_linear_schedule` — try `None` (full WM from step 0)

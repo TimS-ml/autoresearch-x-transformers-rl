@@ -1,13 +1,13 @@
 # x-transformers-rl Adjustable Parameters
 
 Complete reference of all tunable parameters for the autoresearch RL agent.
-Organized by where they appear in `train_rl.py`.
+Organized by where they appear in `train.py`.
 
 ---
 
-## 1. Top-Level Training Config (`train_rl.py` constants)
+## 1. Top-Level Training Config (`train.py` constants)
 
-These are the constants at the top of `train_rl.py` that the agent directly edits.
+These are the constants at the top of `train.py` that the agent directly edits.
 
 ### Time Budget
 
@@ -15,18 +15,24 @@ These are the constants at the top of `train_rl.py` that the agent directly edit
 |---|---|---|
 | `TIME_BUDGET` | `300` | Wall-clock training time in seconds (5 minutes) |
 
+### Reproducibility
+
+| Constant | Default | Description |
+|---|---|---|
+| `SEED` | `42` | Global seed for Python random, NumPy, PyTorch, CUDA, and gymnasium eval envs |
+
 ### Environment
 
 | Constant | Default | Description |
 |---|---|---|
-| `ENV_NAME` | `'CartPole-v1'` | Gymnasium environment name |
-| `MAX_TIMESTEPS` | `500` | Max steps per episode (also positional encoding limit) |
+| `ENV_NAME` | `'LunarLander-v3'` | Gymnasium environment name |
+| `MAX_TIMESTEPS` | `1000` | Max steps per episode (also positional encoding limit) |
 
 ### Critic Value Range
 
 | Constant | Default | Description |
 |---|---|---|
-| `REWARD_RANGE` | `(0., 250.)` | Min/max for the HL-Gauss distributional critic bins. Must cover the expected discounted return range. CartPole: +1/step, gamma=0.99, max 500 steps → range ~(0, 200) |
+| `REWARD_RANGE` | `(-5., 5.)` | Min/max for the HL-Gauss distributional critic bins. Following upstream `train_lander.py`, rewards are clipped to [-5, 5] |
 
 **Critical**: Setting this wrong breaks the critic. Too narrow clips value estimates; too wide wastes bins on unused ranges.
 
@@ -35,7 +41,7 @@ These are the constants at the top of `train_rl.py` that the agent directly edit
 | Constant | Default | Description |
 |---|---|---|
 | `HIDDEN_DIM` | `64` | Transformer residual-stream dimension (the `dim` passed to Decoder) |
-| `WORLD_MODEL_DEPTH` | `2` | Number of transformer layers |
+| `WORLD_MODEL_DEPTH` | `4` | Number of transformer layers |
 | `WORLD_MODEL_HEADS` | `4` | Number of attention heads |
 | `WORLD_MODEL_DIM_HEAD` | `16` | Per-head dimension for Q/K/V projections |
 
@@ -75,7 +81,7 @@ These go into `WORLD_MODEL = dict(...)` and are passed to `x_transformers.Decode
 
 | Parameter | Default | Description |
 |---|---|---|
-| `depth` | `2` | Number of transformer layers |
+| `depth` | `4` | Number of transformer layers |
 | `attn_gate_values` | `True` | Gate attention values with a learned scalar |
 | `add_value_residual` | `True` | ResFormer value residual connections |
 | `ff_relu_squared` | `True` | ReLU² activation (Primer paper) |
@@ -113,7 +119,7 @@ These go into `WORLD_MODEL = dict(...)` and are passed to `x_transformers.Decode
 
 ## 3. Agent Extra Kwargs (`AGENT_KWARGS`)
 
-These are passed through `agent_kwargs=dict(...)` in `train_rl.py`.
+These are passed through `agent_kwargs=dict(...)` in `train.py`.
 
 ### Model Architecture
 
@@ -122,7 +128,7 @@ These are passed through `agent_kwargs=dict(...)` in `train_rl.py`.
 | `hidden_dim` | `48` (Agent default) | Transformer hidden dimension. **Must be set explicitly to match HIDDEN_DIM** |
 | `world_model_attn_dim_head` | `16` | Per-head attention dimension |
 | `world_model_heads` | `4` | Number of attention heads |
-| `world_model_attn_hybrid_gru` | `False` | Use hybrid GRU + attention mechanism |
+| `world_model_attn_hybrid_gru` | `True` | Use hybrid GRU + attention mechanism |
 | `dropout` | `0.0` | Dropout rate for attention and feedforward |
 
 ### Loss Weights
@@ -205,7 +211,7 @@ These go inside `AGENT_KWARGS['actor_critic_world_model'] = dict(...)` and contr
 
 ## 5. Learner-Level Parameters
 
-These are set directly in the `Learner()` constructor in `train_rl.py`.
+These are set directly in the `Learner()` constructor in `train.py`.
 
 ### Continuous Action Space (not used for CartPole)
 
@@ -263,7 +269,7 @@ Passed via `latent_gene_pool=dict(...)` in `Learner`.
 ## 7. Parameter Constraints
 
 - `BATCH_SIZE` must divide `NUM_EPISODES_PER_UPDATE`
-- `REWARD_RANGE` must cover the expected discounted return range (CartPole: ~0 to 200)
+- `REWARD_RANGE` must cover the clipped reward range (LunarLander: -5 to 5)
 - `HIDDEN_DIM` must be passed explicitly via `agent_kwargs` (Agent default is only 48)
 - When using `ff_glu=True`, the effective FFN width is halved (compensate with `ff_mult=8`)
 - `attn_flash=True` requires compatible attention configuration (no custom attention patterns)
@@ -272,7 +278,7 @@ Passed via `latent_gene_pool=dict(...)` in `Learner`.
 
 ### High Impact (try first)
 
-1. **`WORLD_MODEL_DEPTH`**: 2 → 3 or 4 (more capacity)
+1. **`WORLD_MODEL_DEPTH`**: 4 → 6 or 8 (more capacity)
 2. **`NUM_EPISODES_PER_UPDATE`**: 25 → 50 (lower variance gradients)
 3. **`HIDDEN_DIM`**: 64 → 96 or 128 (more model capacity)
 4. **`PPO_EPOCHS`**: 3 → 5 (more gradient steps per update)
@@ -283,7 +289,7 @@ Passed via `latent_gene_pool=dict(...)` in `Learner`.
 6. **`ff_glu=True, ff_swish=True`** in WORLD_MODEL (SwiGLU)
 7. **`GAMMA`**: 0.99 → 0.995 or 0.98
 8. **`ENTROPY_WEIGHT`**: 0.01 → 0.001 or 0.05
-9. **`world_model_attn_hybrid_gru=True`** (recurrent + attention)
+9. **`world_model_attn_hybrid_gru=False`** (disable GRU, pure attention — it's on by default now)
 10. **`add_entropy_to_advantage=True`** (Cheng et al.)
 
 ### Lower Impact / Experimental

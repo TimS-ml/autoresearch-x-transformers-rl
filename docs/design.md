@@ -25,25 +25,29 @@ Key goals:
 
 ## 2. Benchmark Environment Choice
 
-**Decision: `CartPole-v1` (gymnasium)**
+**Decision: `LunarLander-v3` (gymnasium)**
 
 Rationale:
 
 | Option | Pros | Cons |
 |---|---|---|
 | CartPole-v1 | 4-dim obs, 2-action, well-known baseline (500 = solved), fast | Very easy, less room to demonstrate RL improvements |
-| LunarLander-v3 | 8-dim obs, 4-action, non-trivial, established baselines | Slow Box2D physics, ~30s/episode at rollout depth 500 |
+| LunarLander-v3 | 8-dim obs, 4-action, non-trivial, established baselines, shaped reward | Requires Box2D (`pip install gymnasium[box2d]`) |
 | MountainCar-v0 | Sparse reward, classic exploration challenge | Sparse reward makes early training signal near-zero |
 | Pendulum-v1 | Continuous action, good gradient signal | Continuous action space adds complexity to first baseline |
 
-CartPole-v1 was chosen as the **primary benchmark** because:
-1. It is instant to install (no Box2D), runs at thousands of steps/second on CPU.
-2. The solved score of 500 is well-defined, making "better" unambiguous.
-3. 4-dimensional observations are trivial for the world model — experiments
-   can isolate the RL algorithm differences rather than model capacity.
+LunarLander-v3 was chosen as the **primary benchmark** because:
+1. 8-dim observations and 4 discrete actions provide a meaningful test of the
+   world model's capacity — unlike CartPole where the problem is trivially
+   low-dimensional.
+2. The solved score of 200 is well-defined, making "better" unambiguous.
+3. Shaped rewards (landing bonus, crash penalty, fuel cost) give a rich
+   signal — the agent must balance multiple objectives.
+4. It is the upstream reference environment for x-transformers-rl
+   (`train_lander.py`), so parameter defaults are well-calibrated.
 
-LunarLander-v3 is available as a secondary target for experiments after a solid
-CartPole baseline exists.
+CartPole-v1 was the initial prototype environment and can still be used for
+quick sanity-checks by changing `ENV_NAME` in `train.py`.
 
 **Metric: `mean_episode_reward`** over the last N episodes in each training run
 (higher is better).  Reported alongside `peak_vram_mb` and `total_seconds`.
@@ -53,46 +57,51 @@ CartPole baseline exists.
 ## 3. Training Script Design (`train.py`)
 
 - Single file, all configuration at the top as named constants.
+- **Seeded reproducibility**: `SEED = 42` seeds Python `random`, NumPy,
+  PyTorch, CUDA, and gymnasium evaluation environments. Deterministic cuDNN
+  is enabled for cross-run comparability.
 - Fixed **5-minute wall clock** training time (`TIME_BUDGET = 300`).
   The script runs as many `Learner` updates as fit in the time budget,
   calling `learner(env, 1)` in a loop.
+- **Timeout hard-kill**: All runs are wrapped with `timeout 300` at the
+  shell level. Exit code 124 = killed by timeout → treat as crash.
 - Intermediate evaluations are printed every `EVAL_INTERVAL` updates.
 - Output block at the end:
   ```
   ---
-  mean_reward:       139.8333
-  best_reward:       500.0000
-  num_updates:       32
-  total_episodes:    800
-  training_seconds:  304.5
+  mean_reward:       -120.5000
+  best_reward:       45.3000
+  num_updates:       20
+  total_episodes:    500
+  training_seconds:  298.5
   total_seconds:     305.2
-  peak_vram_mb:      96.6
-  num_params_M:      0.2647
+  peak_vram_mb:      150.4
+  num_params_M:      0.4200
   hidden_dim:        64
-  world_model_depth: 2
+  world_model_depth: 4
   ```
-- Logs to `results.tsv`.
+- Logs to `results.tsv` (or `results-<branch>.tsv` for multi-branch runs).
 
-The number of updates varies with model size and episode length (CartPole
-episodes can be 10–500 steps), which means more-capable agents actually
-collect fewer episodes but each episode is longer.  ~30–40 updates in
-5 minutes is typical.
+The number of updates varies with model size and episode length (LunarLander
+episodes can be 100–1000 steps), which means more-capable agents actually
+collect fewer episodes but each episode is longer.
 
 ---
 
 ## 4. World Model Architecture Defaults
 
-Starting configuration for `train.py`:
+Starting configuration for `train.py` (LunarLander-v3):
 
 ```python
+SEED               = 42
 HIDDEN_DIM         = 64
-WORLD_MODEL_DEPTH  = 2
+WORLD_MODEL_DEPTH  = 4
 WORLD_MODEL_HEADS  = 4
 WORLD_MODEL_DIM_HEAD = 16
-REWARD_RANGE       = (0., 250.)
+REWARD_RANGE       = (-5., 5.)
 
 WORLD_MODEL = dict(
-    depth = 2,
+    depth = 4,
     attn_gate_values = True,
     add_value_residual = True,
     ff_relu_squared = True,
@@ -103,6 +112,7 @@ AGENT_KWARGS = dict(
     hidden_dim = 64,                # must be set explicitly (Agent default is 48!)
     world_model_attn_dim_head = 16,
     world_model_heads = 4,
+    world_model_attn_hybrid_gru = True,
     world_model_embed_linear_schedule = (5., 20.),
 )
 ```
@@ -110,13 +120,16 @@ AGENT_KWARGS = dict(
 **Key fix**: `hidden_dim` must be set explicitly via `agent_kwargs`.  The
 `Agent` default is only 48, but we want 64 (= 4 heads × 16 dim_head).
 
-**Key fix**: `REWARD_RANGE` must cover the expected discounted return range.
-CartPole gives +1/step with gamma=0.99 and max 500 steps, so returns are
-in roughly `(0, 200)`.  We use `(0, 250)`.  The previous default of `(-1, 1)`
-broke the HL-Gauss distributional critic and prevented learning.
+**Key fix**: `REWARD_RANGE` must cover the clipped reward range.  Following
+upstream `train_lander.py`, we clip rewards to `(-5, 5)`.  The previous
+CartPole default of `(0, 250)` is not appropriate for LunarLander.
 
-Architecture: ~265K parameters, enough to learn CartPole but small enough
-for fast training (~2.5s per update with 25 episodes).
+**Hybrid GRU**: Enabled by default (`world_model_attn_hybrid_gru=True`),
+matching the upstream reference.  The GRU gate gives the model a recurrent
+pathway to capture LunarLander's sequential dynamics (velocity, rotation).
+
+Architecture: ~420K parameters, enough capacity for the 8-dim LunarLander
+observations with 4-layer depth.
 
 ---
 
@@ -183,18 +196,20 @@ See `AGENTS.md` for the full machine-specific protocol.
 | | This repo |
 |---|---|
 | Metric | mean_reward (higher = better) |
-| Budget | 5-minute wall clock |
-| Environment | CartPole-v1 (stochastic env) |
+| Budget | 5-minute wall clock (hard-killed by `timeout 300`) |
+| Environment | LunarLander-v3 (stochastic env) |
 | Editable file | `train.py` |
-| Results log | `results.tsv` |
+| Results log | `results-<branch>.tsv` (one per population branch) |
+| Search strategy | Population-based multi-branch (3 branches) |
 
 **Variance handling:** RL experiments have high variance.
 A result should only be kept if it improves by more than ~10 reward units over
-the current best, to avoid chasing noise.
+the current best, to avoid chasing noise.  Seeded reproducibility (`SEED=42`)
+reduces but does not eliminate variance (the Learner's rollout collection is
+not fully deterministic).
 
 **Baseline results** (5-minute runs on RTX 4090):
-- Baseline config: mean_reward ≈ 120–140 (high variance)
-- CartPole-v1 is "solved" at mean_reward ≥ 475
+- LunarLander-v3 is "solved" at mean_reward ≥ 200
 - Plenty of room for improvement via architecture, hyperparameters, and training config
 
 ---
@@ -208,7 +223,7 @@ space.  Most-impactful parameters (ordered by expected impact):
 
 | Parameter | Description | Default | Try |
 |---|---|---|---|
-| `depth` | Transformer layers | 2 | 1, 3, 4 |
+| `depth` | Transformer layers | 4 | 2, 6, 8 |
 | `attn_gate_values` | Gate attention values | True | False |
 | `add_value_residual` | ResFormer value residual | True | False |
 | `ff_relu_squared` | ReLU² activation | True | `ff_glu=True, ff_swish=True` |

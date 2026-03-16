@@ -1,4 +1,4 @@
-Autonomous LLM-driven research on reinforcement learning using my fork of [x-transformers-rl](https://github.com/TimS-ml/x-transformers-rl). A transformer world model learns to play CartPole-v1 via PPO, and an AI agent iterates on the architecture and hyperparameters overnight.
+Autonomous LLM-driven research on reinforcement learning using my fork of [x-transformers-rl](https://github.com/TimS-ml/x-transformers-rl). A transformer world model learns to play LunarLander-v3 via PPO, and an AI agent iterates on the architecture and hyperparameters overnight using population-based multi-branch search.
 
 # autoresearch (x-transformers-rl edition)
 
@@ -18,9 +18,9 @@ The repo has a few key files:
 - **`x-transformers-rl/`** — the RL library (git submodule, read-only reference).
 - **`x-transformers/`** — the base transformer library (git submodule, read-only reference).
 
-Environment: **CartPole-v1** (gymnasium). Metric: **mean_reward** — higher is better. Solved at 475+.
+Environment: **LunarLander-v3** (gymnasium). Metric: **mean_reward** — higher is better. Solved at 200+.
 
-By design, training runs for a **fixed 5-minute time budget** (wall clock). This makes experiments directly comparable.
+By design, training runs for a **fixed 5-minute time budget** (wall clock, hard-killed by `timeout 300`). This makes experiments directly comparable. The agent uses **population-based multi-branch search** (3 parallel git branches) to escape local optima.
 
 ## Quick start
 
@@ -32,15 +32,15 @@ git clone --recursive https://github.com/TimS-ml/autoresearch-x-transformers-rl
 cd autoresearch-x-transformers-rl
 
 # 2. Install dependencies
-pip install gymnasium hl-gauss-pytorch assoc-scan x-mlps-pytorch \
+pip install "gymnasium[box2d]" hl-gauss-pytorch assoc-scan x-mlps-pytorch \
     accelerate adam-atan2-pytorch ema-pytorch einx einops
 
 # 3. Verify imports work
 python -c "from x_transformers_rl import Learner; print('OK')"
 python -c "import gymnasium; print('OK')"
 
-# 4. Run a single training experiment (~5 min)
-CUDA_VISIBLE_DEVICES=0 python train.py
+# 4. Run a single training experiment (~5 min, hard-killed at 300s)
+CUDA_VISIBLE_DEVICES=0 timeout 300 python train.py
 ```
 
 ## Running the agent
@@ -70,8 +70,10 @@ x-transformers/             — base transformer library (git submodule, read-on
 ## Design choices
 
 - **x-transformers-rl as the backbone.** Phil Wang's library wraps a causal Transformer world model with PPO actor-critic heads, distributional critic (HL-Gauss), curiosity rewards, evolutionary gene pools, and more — a huge search space for the agent.
-- **CartPole-v1.** Fast (thousands of steps/second), well-defined solved score (475+), trivial to install (no Box2D). Isolates RL algorithm differences from model capacity.
-- **Fixed 5-minute time budget.** Training always runs for exactly 5 minutes. ~12 experiments/hour, ~100 overnight.
+- **LunarLander-v3.** 8-dim observations, 4 discrete actions, shaped rewards. Non-trivial enough to expose real architecture differences, fast enough for rapid iteration.
+- **Fixed 5-minute time budget.** Training hard-killed by `timeout 300`. ~12 experiments/hour, ~100 overnight.
+- **Population-based multi-branch search.** 3 parallel git branches explore different regions of the search space. Periodic migration (cherry-pick) of winning changes prevents getting stuck in local optima.
+- **Seeded reproducibility.** Global seed (torch, numpy, random, gymnasium) for cross-run comparability.
 - **Self-contained.** One GPU, one file, one metric. The submodules provide the model; everything else is standard PyTorch + gymnasium.
 
 ## Bug fixes in x-transformers-rl
